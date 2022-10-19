@@ -16,6 +16,13 @@ from scipy.sparse.linalg import svds
 import flask
 from flask import flash, redirect, request, url_for, render_template
 import os
+from transformers import AutoModelWithLMHead, AutoTokenizer
+from transformers import T5Tokenizer, T5Model, T5ForConditionalGeneration
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+from torch import optim
+from tqdm import tqdm
+import unicodedata
 
 UPLOAD_FOLDER = '/static'
 ALLOWED_EXTENSIONS = {'txt'}
@@ -155,6 +162,199 @@ class T1RNN:
         return words.replace("\\", "")
 
 
+class Preprocessing:
+    def benerin_text(self, text):  # Benerin text per list dari nilai kolom (belum digabung)
+        text = unicodedata.normalize('NFKD', text)
+        text = text.replace('  ', ' ')
+        text = text.replace('“', '"')
+        text = text.replace('‘', "'")
+        text = re.sub(r' - - ', '--', text)
+        text = re.sub(r'\s([.|,|?|!|:|;|=|%|$])', r'\1', text)
+        text = re.sub(r'([#])\s', r'\1', text)
+        # !"#$%&'()*+, -./:;<=>?@[\]^_`{|}~
+        text = re.sub(r'\s([/|–|-])\s', r'\1', text)
+
+        # Bakal nyari semua string yang ada di dalem "tanda" dan ngehasilin list dari stringnya
+        text_f = re.findall(r'\(.*?\)', text)
+        for i in text_f:
+            text = text.replace(i, f"({i[2:-2]})")
+
+        text_g = re.findall(r'\".*?\"', text)
+        for j in text_g:
+            text = text.replace(j, f'"{j[2:-2]}"')
+
+        text_h = re.findall(r'\'.*?\'', text)
+        for k in text_h:
+            text = text.replace(k, f"'{k[2:-2]}'")
+
+        text_i = re.findall(r'\[.*?\]', text)
+        for h in text_i:
+            text = text.replace(h, f"[{h[2:-2]}]")
+
+        return text.replace('  ', ' ')
+
+    def preprocess(self, df):
+        for ix in range(len(df)):
+            text = []
+            for i in df['paragraphs'][ix]:
+                for j in i:
+                    text.append(' '.join(j))
+                df['paragraphs'][ix] = ' '.join(text)
+
+        for ix in range(len(df)):
+            text = []
+            for i in df['summary'][ix]:
+                text.append(' '.join(i))
+            df['summary'][ix] = ' '.join(text)
+
+        # Apply benerin_text ke column paragh per valuenya
+        df['paragraphs'] = df['paragraphs'].apply(
+            lambda x: self.benerin_text(x))
+        df['summary'] = df['summary'].apply(lambda x: self.benerin_text(x))
+
+        return df
+
+
+tokenizer = T5Tokenizer.from_pretrained(
+    "t5-base-indonesian-summarization-cased")
+model = T5ForConditionalGeneration.from_pretrained(
+    "t5-base-indonesian-summarization-cased")
+
+
+class BertDataset:
+    def __init__(self, data, tokenizer):
+        self.data = data
+        self.summary = self.data["summary"]
+        self.paragraphs = self.data["paragraphs"]
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.paragraphs)
+
+    def __getitem__(self, index):
+        paragraphs = str(self.paragraphs[index])
+        summary = str(self.summary[index])
+        pad = tokenizer.pad_token
+        eos = tokenizer.eos_token
+        encoding_paragraphs = self.tokenizer.encode_plus("summarize: " + paragraphs + eos,
+                                                         return_token_type_ids=False,
+                                                         return_attention_mask=True,
+                                                         max_length=512,
+                                                         pad_to_max_length=True,
+                                                         return_tensors='pt')
+
+        encoding_summary = self.tokenizer.encode(pad + summary + eos,
+                                                 add_special_tokens=False,
+                                                 return_token_type_ids=False,
+                                                 max_length=150,
+                                                 pad_to_max_length=True,
+                                                 return_tensors='pt')
+        return {
+            'sentence_text': paragraphs,
+            'summary_text': summary,
+            'input_ids': encoding_paragraphs['input_ids'].flatten(),
+            'attention_mask': encoding_paragraphs['attention_mask'].flatten(),
+            'lm_labels': encoding_summary.flatten(),
+        }
+
+
+class T5:
+    def train(self, train, dev):
+        train = Preprocessing.preprocess(train)
+        dev = Preprocessing.preprocess(dev)
+
+        train_set = BertDataset(train, tokenizer)
+        train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
+        val_set = BertDataset(dev, tokenizer)
+        val_loader = DataLoader(val_set, batch_size=2, shuffle=True)
+
+        optimizer = optim.AdamW(model.parameters(), lr=3e-5)
+        model = model.to("cuda")
+
+        best_val_loss = 999999
+        early_stop = 0
+        epochs = 100
+        for _ in range(epochs):
+            model.train()
+            train_loss = 0
+            for idx, data in tqdm(enumerate(train_loader)):
+                sentence_text, summary_text, input_ids, attention_mask, lm_labels = data["sentence_text"], data[
+                    "summary_text"], data["input_ids"], data["attention_mask"], data["lm_labels"]
+                input_ids = input_ids.to()
+                attention_mask = attention_mask.to("cuda")
+                lm_labels = lm_labels.to("cuda")
+                optimizer.zero_grad()
+                output = model(input_ids=input_ids,
+                               attention_mask=attention_mask, labels=lm_labels)
+                loss, prediction_scores = output[:2]
+                train_loss += loss.item()
+                loss.backward()
+                optimizer.step()
+                if ((idx % 1000) == 0):
+                    print("loss: ", loss.item(),
+                          " train_loss: ", train_loss/(idx+1))
+
+            model.eval()
+            with torch.no_grad():
+                val_loss = 0
+                for idx, data in tqdm(enumerate(val_loader)):
+                    sentence_text, summary_text, input_ids, attention_mask, lm_labels = data["sentence_text"], data[
+                        "summary_text"], data["input_ids"], data["attention_mask"], data["lm_labels"]
+                    input_ids = input_ids.to("cuda")
+                    attention_mask = attention_mask.to("cuda")
+                    lm_labels = lm_labels.to("cuda")
+                    optimizer.zero_grad()
+                    output = model(
+                        input_ids=input_ids, attention_mask=attention_mask, lm_labels=lm_labels)
+                    loss, prediction_scores = output[:2]
+                    val_loss += loss.item()
+
+            if ((val_loss/len(val_loader)) < best_val_loss):
+                model.save_pretrained("drive/My Drive/model_summarization/")
+                best_val_loss = (val_loss/len(val_loader))
+            else:
+                early_stop += 1
+            print("train_loss: ", train_loss/len(train_loader))
+            print("val_loss: ", val_loss/len(val_loader))
+
+            if (early_stop == 3):
+                break
+
+    def predict(self, pred):
+        pred_set = BertDataset(pred, tokenizer)
+        pred_loader = DataLoader(pred_set, batch_size=4, shuffle=True)
+
+        with torch.no_grad():
+            data = next(iter(pred_loader))
+            sentence_text, summary_text, input_ids, attention_mask, lm_labels = data["sentence_text"], data[
+                "summary_text"], data["input_ids"], data["attention_mask"], data["lm_labels"]
+            input_ids = input_ids.to()
+            attention_mask = attention_mask.to()
+            lm_labels = lm_labels.to()
+            generated = model.generate(input_ids=input_ids,
+                                       attention_mask=attention_mask,
+                                       min_length=20,
+                                       max_length=80,
+                                       num_beams=10,
+                                       repetition_penalty=2.5,
+                                       length_penalty=1.0,
+                                       early_stopping=True,
+                                       no_repeat_ngram_size=2,
+                                       use_cache=True,
+                                       do_sample=True,
+                                       temperature=0.8,
+                                       top_k=50,
+                                       top_p=0.95)
+            tokenizer.decode(generated[0])
+            # print("full text")
+            # print(sentence_text[0])
+            # print("summary")
+            # print(summary_text[0])
+            # print("Generated summary")
+            # print(tokenizer.decode(generated[0], skip_special_tokens=True))
+            return tokenizer.decode(generated[0], skip_special_tokens=True)
+
+
 def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -172,16 +372,18 @@ def predict():
     # view
     if flask.request.method == "POST":
         translator = Translator()
-        translation = translator.translate(request.form['tts'])
+        file = request.form['tts']
         with open("static/news.txt", "w") as text_file:
-            text_file.write(translation.text)
+            text_file.write(file)
 
+        pred = pd.read_json('static/news.txt', lines=True)
         rephrase = Rephrase()
         t1rnn = T1RNN()
-        text_summ = t1rnn.LSA('static/news.txt')
+        t5 = T5()
+        text_summ = t5.predict(pred)
         # paraphrase_text = rephrase.paraphrase(text_summ)
-        final_summ = translator.translate(text_summ, dest='id')
-        return render_template('index.html', data=final_summ)
+        # final_summ = translator.translate(text_summ, dest='id')
+        return render_template('index.html', data=text_summ)
     return render_template('index.html', data="")
 
 
